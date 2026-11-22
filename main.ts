@@ -287,6 +287,9 @@ interface USection {
   headerStart: number; // 0-based line index
 }
 
+/** `@@ -A[,B] +C[,D] @@` with optional trailing text; B and D are parsed but not used. */
+const HUNK_RE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+
 function parseDiffGit(line: string): { oldP: string; newP: string } | null {
   // diff --git a/<X> b/<Y>
   if (!line.startsWith('diff --git ')) return null;
@@ -376,7 +379,12 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
 
     // A deletion deletes the file without reading its hunks (section 6).
     if (sec.isDel || newP === '/dev/null') {
-      while (i < n && !isSectionStart(i)) i++;
+      while (i < n && !isSectionStart(i)) {
+        // Hunks are not read, but any other line starting with `@@` is still a parse error
+        // (section 6's hunk rule applies everywhere in the patch).
+        if (lines[i]!.startsWith('@@') && !HUNK_RE.test(lines[i]!)) throw new Exit2(`error: parse ${i + 1}`);
+        i++;
+      }
       edits.push(buildUnifiedEdit(sec, oldP, newP, strict));
       continue;
     }
@@ -387,7 +395,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
       if (l.startsWith('diff --git ')) break;
       if (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')) break;
       if (l.startsWith('@@')) {
-        const m = l.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        const m = l.match(HUNK_RE);
         if (!m) throw new Exit2(`error: parse ${i + 1}`);
         const a = parseInt(m[1]!, 10);
         i++;
@@ -641,7 +649,7 @@ interface RawLine { text: string; line: number; }
 const ADD_HEAD = '*** Add File: ';
 const DEL_HEAD = '*** Delete File: ';
 const UPD_HEAD = '*** Update File: ';
-const MOVE_HEAD = '*** Move to:';
+const MOVE_HEAD = '*** Move to: ';
 const EOF_MARK = '*** End of File';
 const END_MARK = '*** End Patch';
 
@@ -780,9 +788,10 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
     i = sect.end;
 
     if (head.startsWith(ADD_HEAD)) {
+      // An Add File line starts with `+`, or is empty (an empty line of the file) — section 8.
       const fileLinesOut = raw.map((r) => (r.text.startsWith('+') ? r.text.slice(1) : r.text));
       for (const r of raw) {
-        if (!r.text.startsWith('+') && !blank(r.text)) throw new Exit2(`error: parse ${r.line + 1}`);
+        if (!r.text.startsWith('+') && r.text !== '') throw new Exit2(`error: parse ${r.line + 1}`);
       }
       edits.push(v4aAddEdit(path, fileLinesOut));
       continue;
@@ -814,10 +823,13 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
           current = null;
           continue;
         }
-        if (blank(text)) {
+        if (text === '') {
+          // An empty line is a body line (an empty context line), and may start the first
+          // chunk; other blank, non-empty lines are parsed by their first character below.
           if (current === null) {
-            if (chunks.length === 0) { current = { anchor: null, body: [], eof: false }; chunks.push(current); }
-            continue; // blank after an End of File chunk is not part of a chunk
+            if (chunks.length !== 0) throw new Exit2(`error: parse ${line + 1}`);
+            current = { anchor: null, body: [], eof: false };
+            chunks.push(current);
           }
           current.body.push({ kind: 'empty-ctx', text: '', line });
           continue;
@@ -933,19 +945,17 @@ function run(args: string[]): { code: number; out: string[] } {
   }
   rowItems.sort((a, b) => Buffer.compare(Buffer.from(a.sortKey), Buffer.from(b.sortKey)));
   if (!check) {
+    // Remove every path that disappears first: an R row sorts by its new path, so a file
+    // created under a moved-away path could otherwise be written while that path is a file.
     for (const r of rowItems) {
-      if (r.action === 'R') {
-        rmSync(r.oldPath!, { force: true });
-        const now = tree.now.get(r.path)!;
-        mkdirSync(dirname(r.path), { recursive: true });
-        writeFileSync(r.path, now);
-      } else if (r.action === 'D') {
-        rmSync(r.path, { force: true });
-      } else {
-        const now = tree.now.get(r.path)!;
-        mkdirSync(dirname(r.path), { recursive: true });
-        writeFileSync(r.path, now);
-      }
+      if (r.action === 'D') rmSync(r.path, { force: true });
+      else if (r.action === 'R') rmSync(r.oldPath!, { force: true });
+    }
+    for (const r of rowItems) {
+      if (r.action === 'D') continue;
+      const now = tree.now.get(r.path)!;
+      mkdirSync(dirname(r.path), { recursive: true });
+      writeFileSync(r.path, now);
     }
   }
   return { code: 0, out: [...rowItems.map(r => r.line), `ok: ${rowItems.length} ${rowItems.length === 1 ? 'file' : 'files'}`] };
