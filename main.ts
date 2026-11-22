@@ -314,7 +314,12 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   }
 
   while (i < n) {
-    if (!isSectionStart(i)) { i++; continue; }
+    if (!isSectionStart(i)) {
+      // A hunk (or any other @@ line) before a section is a parse error at its own line (section 6).
+      if (lines[i]!.startsWith('@@')) throw new Exit2(`error: parse ${i + 1}`);
+      i++;
+      continue;
+    }
     const sec: USection = {
       oldPath: null, newPath: null, renameFrom: null, renameTo: null,
       isNew: false, isDel: false, gitOld: null, gitNew: null, hunks: [], headerStart: i,
@@ -359,14 +364,22 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     let oldP = sec.oldPath;
     let newP = sec.newPath;
     if (oldP === null && newP === null) {
-      if (sec.renameFrom !== null) oldP = stripAB(sec.renameFrom.trim());
-      if (sec.renameTo !== null) newP = stripAB(sec.renameTo.trim());
+      // Rename paths are named as the patch wrote them: only ---/+++ paths lose an a/ or b/ prefix (section 6).
+      if (sec.renameFrom !== null) oldP = sec.renameFrom.trim();
+      if (sec.renameTo !== null) newP = sec.renameTo.trim();
     }
     if (oldP === null && sec.gitOld !== null) oldP = sec.gitOld;
     if (newP === null && sec.gitNew !== null) newP = sec.gitNew;
     // if only one side known from git in weird case, mirror
     if (oldP === null && newP !== null) oldP = newP;
     if (newP === null && oldP !== null) newP = oldP;
+
+    // A deletion deletes the file without reading its hunks (section 6).
+    if (sec.isDel || newP === '/dev/null') {
+      while (i < n && !isSectionStart(i)) i++;
+      edits.push(buildUnifiedEdit(sec, oldP, newP, strict));
+      continue;
+    }
 
     // parse hunks
     while (i < n) {
@@ -397,8 +410,9 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
           // any other line ends body (prose/fences outside body)
           break;
         }
-        // trim empty context lines at end of body - spec: "empty lines at the end of a body are not part of it"
-        while (body.length > 0 && body[body.length - 1]!.kind === 'empty-ctx') body.pop();
+        // Trim empty context lines at the end of a body, but not one that a \ line belongs to: that line is still
+        // followed by a body line, so the pair is part of the body (section 6).
+        while (body.length > 0 && body[body.length - 1]!.kind === 'empty-ctx' && !body[body.length - 1]!.noNl) body.pop();
         sec.hunks.push({ a, body });
         continue;
       }
@@ -419,13 +433,14 @@ function buildUnifiedEdit(sec: USection, oldP: string | null, newP: string | nul
   const realNew = newP === '/dev/null' ? null : newP;
   const targetOld = realOld ?? realNew;
   const targetNew = realNew ?? realOld;
-  if (targetOld === null || targetNew === null) {
-    return () => { throw new Exit2('error: parse 1'); };
-  }
+  // Both sides /dev/null names no file: the reader found no edit (section 2). Report this while parsing, before
+  // any file is looked at, not while the edit is applied.
+  if (targetOld === null || targetNew === null) throw new Exit2('error: parse 1');
 
   return (tree: Tree, moves: Move[]) => {
-    if (!safe(targetOld)) throw new Fail('unsafe', oldP ?? targetOld);
-    if (!safe(targetNew)) throw new Fail('unsafe', newP ?? targetNew);
+    // Name the path that was checked, as the patch wrote it (after --- / +++ prefix removal), never /dev/null.
+    if (!safe(targetOld)) throw new Fail('unsafe', realOld ?? targetOld);
+    if (!safe(targetNew)) throw new Fail('unsafe', realNew ?? targetNew);
 
     if (isCreate) {
       if (tree.get(targetNew) !== null) throw new Fail('exists', targetNew);
@@ -793,7 +808,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
           chunks.push(current);
           continue;
         }
-        if (text.trim() === EOF_MARK) {
+        if (text === EOF_MARK) {
           if (current === null) throw new Exit2(`error: parse ${line + 1}`);
           current.eof = true;
           current = null;
